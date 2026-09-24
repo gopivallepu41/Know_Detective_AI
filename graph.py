@@ -1,4 +1,5 @@
 import re
+import time
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -7,6 +8,14 @@ from langgraph.graph import END, START, StateGraph
 
 from config import GOOGLE_API_KEY, GOOGLE_MODEL
 from schemas import InvestigationState
+
+
+# ============================================================
+# RETRY SETTINGS
+# ============================================================
+
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SECONDS = 5
 
 
 # ============================================================
@@ -217,13 +226,72 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """
+    Best-effort check for a Google API rate-limit / quota error,
+    without depending on a specific exception class.
+    """
+
+    message = str(exc)
+
+    return (
+        "429" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "quota" in message.lower()
+    )
+
+
+def _extract_retry_delay(exc: Exception, fallback: float) -> float:
+    """
+    Try to pull the server-suggested retry delay (e.g. "retryDelay": "22s")
+    out of the error message; fall back to our own backoff value otherwise.
+    """
+
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", str(exc))
+
+    if match:
+        try:
+            return float(match.group(1)) + 1  # small safety buffer
+        except ValueError:
+            pass
+
+    return fallback
+
+
 def _invoke_prompt(prompt, **kwargs) -> str:
 
     chain = prompt | _llm()
 
-    response = chain.invoke(kwargs)
+    backoff = INITIAL_BACKOFF_SECONDS
 
-    return _content_to_text(response.content)
+    last_error: Exception = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+            response = chain.invoke(kwargs)
+            return _content_to_text(response.content)
+
+        except Exception as exc:
+
+            last_error = exc
+
+            if not _is_rate_limit_error(exc) or attempt == MAX_RETRIES:
+                raise
+
+            wait_time = _extract_retry_delay(exc, backoff)
+
+            print(
+                f"[KnowDetective] Rate limit hit (attempt {attempt}/"
+                f"{MAX_RETRIES}). Retrying in {wait_time:.0f}s..."
+            )
+
+            time.sleep(wait_time)
+
+            backoff *= 2  # exponential backoff for the next attempt
+
+    # Should not be reached, but keep a safe fallback.
+    raise last_error
 
 
 def _get_state_value(
